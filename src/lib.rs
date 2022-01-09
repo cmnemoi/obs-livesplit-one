@@ -1,3 +1,4 @@
+use core::fmt;
 use std::{
     cmp::Ordering,
     ffi::{c_void, CStr},
@@ -13,23 +14,28 @@ mod ffi;
 mod ffi_types;
 
 use ffi::{
-    gs_draw_sprite, gs_effect_get_param_by_name, gs_effect_get_technique, gs_effect_set_texture,
-    gs_effect_t, gs_technique_begin, gs_technique_begin_pass, gs_technique_end,
-    gs_technique_end_pass, gs_texture_create, gs_texture_destroy, gs_texture_set_image,
-    gs_texture_t, obs_data_get_int, obs_data_get_string, obs_data_set_default_int, obs_data_t,
-    obs_enter_graphics, obs_get_base_effect, obs_hotkey_id, obs_hotkey_register_source,
-    obs_hotkey_t, obs_leave_graphics, obs_module_t, obs_mouse_event, obs_properties_add_button,
-    obs_properties_add_int, obs_properties_add_path, obs_properties_create, obs_properties_t,
-    obs_property_t, obs_register_source_s, obs_source_info, obs_source_t, GS_DYNAMIC, GS_RGBA,
+    blog, gs_draw_sprite, gs_effect_get_param_by_name, gs_effect_get_technique,
+    gs_effect_set_texture, gs_effect_t, gs_technique_begin, gs_technique_begin_pass,
+    gs_technique_end, gs_technique_end_pass, gs_texture_create, gs_texture_destroy,
+    gs_texture_set_image, gs_texture_t, obs_data_get_int, obs_data_get_string,
+    obs_data_set_default_int, obs_data_t, obs_enter_graphics, obs_get_base_effect, obs_hotkey_id,
+    obs_hotkey_register_source, obs_hotkey_t, obs_leave_graphics, obs_module_t, obs_mouse_event,
+    obs_properties_add_button, obs_properties_add_int, obs_properties_add_path,
+    obs_properties_create, obs_properties_t, obs_property_t, obs_register_source_s,
+    obs_source_info, obs_source_t, GS_DYNAMIC, GS_RGBA, LOG_WARNING,
     OBS_EFFECT_PREMULTIPLIED_ALPHA, OBS_ICON_TYPE_GAME_CAPTURE, OBS_PATH_FILE,
     OBS_SOURCE_CUSTOM_DRAW, OBS_SOURCE_INTERACTION, OBS_SOURCE_TYPE_INPUT, OBS_SOURCE_VIDEO,
 };
+use ffi_types::{LOG_DEBUG, LOG_ERROR, LOG_INFO};
+#[cfg(feature = "auto-splitting")]
+use livesplit_core::auto_splitting;
 use livesplit_core::{
     layout::{self, LayoutSettings, LayoutState},
     rendering::software::Renderer,
     run::{parser::composite, saver::livesplit::save_timer},
-    Layout, Run, Segment, Timer,
+    Layout, Run, Segment, SharedTimer, Timer,
 };
+use log::{Level, LevelFilter, Log, Metadata, Record};
 use once_cell::sync::Lazy;
 
 macro_rules! cstr {
@@ -58,7 +64,9 @@ unsafe impl<T> Sync for UnsafeMultiThread<T> {}
 unsafe impl<T> Send for UnsafeMultiThread<T> {}
 
 struct State {
-    timer: Timer,
+    timer: SharedTimer,
+    #[cfg(feature = "auto-splitting")]
+    auto_splitter: auto_splitting::Runtime,
     layout: Layout,
     state: LayoutState,
     renderer: Renderer,
@@ -70,6 +78,8 @@ struct State {
 struct Settings {
     run: Run,
     layout: Layout,
+    #[cfg(feature = "auto-splitting")]
+    auto_splitter_path: String,
     width: u32,
     height: u32,
 }
@@ -87,12 +97,18 @@ fn parse_run(path: &CStr) -> Option<Run> {
     Some(run.run)
 }
 
-// fn log(x: fmt::Arguments<'_>) {
-//     let str = format!("{}\0", x);
-//     unsafe {
-//         blog(LOG_WARNING as _, str.as_ptr().cast());
-//     }
-// }
+fn log(level: Level, target: &str, x: &fmt::Arguments<'_>) {
+    let str = format!("[LiveSplit One][{}] {}\0", target, x);
+    let level = match level {
+        Level::Error => LOG_ERROR,
+        Level::Warn => LOG_WARNING,
+        Level::Info => LOG_INFO,
+        Level::Debug | Level::Trace => LOG_DEBUG,
+    };
+    unsafe {
+        blog(level as _, b"%s\0".as_ptr().cast(), str.as_ptr());
+    }
+}
 
 fn parse_layout(path: &CStr) -> Option<Layout> {
     let path = path.to_str().ok()?;
@@ -116,12 +132,23 @@ unsafe fn parse_settings(settings: *mut obs_data_t) -> Settings {
     let layout_path = CStr::from_ptr(obs_data_get_string(settings, SETTINGS_LAYOUT_PATH).cast());
     let layout = parse_layout(layout_path).unwrap_or_else(Layout::default_layout);
 
+    #[cfg(feature = "auto-splitting")]
+    let auto_splitter_path = CStr::from_ptr(obs_data_get_string(
+        settings,
+        SETTINGS_AUTO_SPLITTER_PATH.cast(),
+    ))
+    .to_str()
+    .unwrap_or_default()
+    .to_owned();
+
     let width = obs_data_get_int(settings, SETTINGS_WIDTH) as u32;
     let height = obs_data_get_int(settings, SETTINGS_HEIGHT) as u32;
 
     Settings {
         run,
         layout,
+        #[cfg(feature = "auto-splitting")]
+        auto_splitter_path,
         width,
         height,
     }
@@ -132,11 +159,24 @@ impl State {
         Settings {
             run,
             layout,
+            #[cfg(feature = "auto-splitting")]
+            auto_splitter_path,
             width,
             height,
         }: Settings,
     ) -> Self {
-        let timer = Timer::new(run).unwrap();
+        log::info!("Loading settings.");
+        let timer = Timer::new(run).unwrap().into_shared();
+
+        #[cfg(feature = "auto-splitting")]
+        let auto_splitter = auto_splitting::Runtime::new(timer.clone());
+        #[cfg(feature = "auto-splitting")]
+        if !auto_splitter_path.is_empty() {
+            auto_splitter
+                .load_script(PathBuf::from(auto_splitter_path))
+                .ok();
+        }
+
         let state = LayoutState::default();
         let renderer = Renderer::new();
 
@@ -147,6 +187,8 @@ impl State {
         Self {
             timer,
             layout,
+            #[cfg(feature = "auto-splitting")]
+            auto_splitter,
             state,
             renderer,
             texture,
@@ -157,7 +199,7 @@ impl State {
 
     unsafe fn update(&mut self) {
         self.layout
-            .update_state(&mut self.state, &self.timer.snapshot());
+            .update_state(&mut self.state, &self.timer.read().snapshot());
 
         self.renderer.render(&self.state, [self.width, self.height]);
         gs_texture_set_image(
@@ -181,7 +223,7 @@ unsafe extern "C" fn split(
 ) {
     if pressed {
         let state: &mut State = &mut *data.cast();
-        state.timer.split_or_start();
+        state.timer.write().split_or_start();
     }
 }
 
@@ -193,7 +235,7 @@ unsafe extern "C" fn reset(
 ) {
     if pressed {
         let state: &mut State = &mut *data.cast();
-        state.timer.reset(true);
+        state.timer.write().reset(true);
     }
 }
 
@@ -205,7 +247,7 @@ unsafe extern "C" fn undo(
 ) {
     if pressed {
         let state: &mut State = &mut *data.cast();
-        state.timer.undo_split();
+        state.timer.write().undo_split();
     }
 }
 
@@ -217,7 +259,7 @@ unsafe extern "C" fn skip(
 ) {
     if pressed {
         let state: &mut State = &mut *data.cast();
-        state.timer.skip_split();
+        state.timer.write().skip_split();
     }
 }
 
@@ -229,7 +271,7 @@ unsafe extern "C" fn pause(
 ) {
     if pressed {
         let state: &mut State = &mut *data.cast();
-        state.timer.toggle_pause_or_start();
+        state.timer.write().toggle_pause_or_start();
     }
 }
 
@@ -241,7 +283,7 @@ unsafe extern "C" fn undo_all_pauses(
 ) {
     if pressed {
         let state: &mut State = &mut *data.cast();
-        state.timer.undo_all_pauses();
+        state.timer.write().undo_all_pauses();
     }
 }
 
@@ -253,7 +295,7 @@ unsafe extern "C" fn previous_comparison(
 ) {
     if pressed {
         let state: &mut State = &mut *data.cast();
-        state.timer.switch_to_previous_comparison();
+        state.timer.write().switch_to_previous_comparison();
     }
 }
 
@@ -265,7 +307,7 @@ unsafe extern "C" fn next_comparison(
 ) {
     if pressed {
         let state: &mut State = &mut *data.cast();
-        state.timer.switch_to_next_comparison();
+        state.timer.write().switch_to_next_comparison();
     }
 }
 
@@ -277,7 +319,7 @@ unsafe extern "C" fn toggle_timing_method(
 ) {
     if pressed {
         let state: &mut State = &mut *data.cast();
-        state.timer.toggle_timing_method();
+        state.timer.write().toggle_timing_method();
     }
 }
 
@@ -416,9 +458,10 @@ unsafe extern "C" fn save_splits(
     data: *mut c_void,
 ) -> bool {
     let state: &mut State = &mut *data.cast();
-    if let Some(path) = state.timer.run().path() {
+    let timer = state.timer.read();
+    if let Some(path) = timer.run().path() {
         if let Ok(file) = File::create(path) {
-            let _ = save_timer(&state.timer, BufWriter::new(file));
+            let _ = save_timer(&timer, BufWriter::new(file));
         }
     }
     false
@@ -428,6 +471,8 @@ const SETTINGS_WIDTH: *const c_char = cstr!("width");
 const SETTINGS_HEIGHT: *const c_char = cstr!("height");
 const SETTINGS_SPLITS_PATH: *const c_char = cstr!("splits_path");
 const SETTINGS_LAYOUT_PATH: *const c_char = cstr!("layout_path");
+#[cfg(feature = "auto-splitting")]
+const SETTINGS_AUTO_SPLITTER_PATH: *const c_char = cstr!("auto_splitter_path");
 const SETTINGS_SAVE_SPLITS: *const c_char = cstr!("save_splits");
 
 unsafe extern "C" fn get_properties(_: *mut c_void) -> *mut obs_properties_t {
@@ -448,6 +493,15 @@ unsafe extern "C" fn get_properties(_: *mut c_void) -> *mut obs_properties_t {
         cstr!("Layout"),
         OBS_PATH_FILE,
         cstr!("LiveSplit Layouts (*.lsl *.ls1l)"),
+        ptr::null(),
+    );
+    #[cfg(feature = "auto-splitting")]
+    obs_properties_add_path(
+        props,
+        SETTINGS_AUTO_SPLITTER_PATH,
+        cstr!("Auto Splitter"),
+        OBS_PATH_FILE,
+        cstr!("LiveSplit One Auto Splitter (*.wasm)"),
         ptr::null(),
     );
     obs_properties_add_button(
@@ -471,10 +525,21 @@ fn default_run() -> Run {
 }
 
 unsafe extern "C" fn update(data: *mut c_void, settings: *mut obs_data_t) {
+    log::info!("Reloading settings.");
+
     let state: &mut State = &mut *data.cast();
     let settings = parse_settings(settings);
-    state.timer.set_run(settings.run).unwrap();
+    state.timer.write().set_run(settings.run).unwrap();
     state.layout = settings.layout;
+
+    #[cfg(feature = "auto-splitting")]
+    if !settings.auto_splitter_path.is_empty() {
+        state
+            .auto_splitter
+            .load_script(PathBuf::from(settings.auto_splitter_path))
+            .ok();
+    }
+
     if state.width != settings.width || state.height != settings.height {
         state.width = settings.width;
         state.height = settings.height;
@@ -492,6 +557,22 @@ unsafe extern "C" fn update(data: *mut c_void, settings: *mut obs_data_t) {
         gs_texture_destroy(texture);
         obs_leave_graphics();
     }
+}
+
+struct ObsLog;
+
+impl Log for ObsLog {
+    fn enabled(&self, _metadata: &Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &Record) {
+        if self.enabled(record.metadata()) {
+            log(record.level(), record.target(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
 }
 
 #[no_mangle]
@@ -517,6 +598,9 @@ pub extern "C" fn obs_module_load() -> bool {
             }
         })
     });
+
+    let _ = log::set_logger(&ObsLog);
+    log::set_max_level(LevelFilter::Debug);
 
     let source_info: &obs_source_info = &SOURCE_INFO.0;
 
